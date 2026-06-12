@@ -28,30 +28,71 @@ The generated HTML report includes:
 
 - **macOS** (uses macOS-specific system commands)
 - **Python 3.9+**
-- **OpenAI API key** (GPT-4o recommended)
+- **One of the supported AI providers:**
+  - **Anthropic** (Claude Opus 4.8 — the default)
+  - **OpenAI** (GPT-4o)
+  - **Google Gemini** (Gemini 2.5 Pro)
+  - **Ollama** — run a model **fully locally**, no API key, no cloud
+
+## Provider Selection
+
+The tool works with **Anthropic (Claude)**, **OpenAI (GPT)**, **Google (Gemini)**,
+or **Ollama (local models)**. It picks a provider automatically based on which API
+key is set, and falls back to a fully local Ollama model when no cloud key is
+present. You can always force a choice with `--provider` or the `PROVIDER` env var.
+
+| Situation | Provider used |
+|-----------|---------------|
+| `--provider` / `PROVIDER` is set | That provider (explicit) |
+| `ANTHROPIC_API_KEY` is set | Anthropic |
+| else `OPENAI_API_KEY` is set | OpenAI |
+| else `GEMINI_API_KEY` / `GOOGLE_API_KEY` is set | Gemini |
+| no cloud key at all | Ollama (local) |
 
 ## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/brunoterkaly/mac-performance-triage.git
+git clone https://github.com/alkari/mac-performance-triage.git
 cd mac-performance-triage
 
-# Install dependencies
+# Install dependencies (bundles all provider SDKs)
 pip install -r requirements.txt
 
-# Set your OpenAI API key
-export OPENAI_API_KEY="your_api_key_here"
+# Set the API key for whichever cloud provider you want to use
+export ANTHROPIC_API_KEY="your_api_key_here"   # Claude (default)
+export OPENAI_API_KEY="your_api_key_here"      # GPT
+export GEMINI_API_KEY="your_api_key_here"      # Gemini
 ```
+
+### Running locally with Ollama (no API key)
+
+```bash
+# Install Ollama from https://ollama.com, then:
+ollama serve            # start the local server
+ollama pull llama3.1    # pull a model (one time)
+
+python3 mac-ai-healthcheck.py --provider ollama --model llama3.1
+```
+
+> Local models are smaller than frontier cloud models; the generated capture
+> script and HTML report may be simpler. Point at a non-default host with the
+> `OLLAMA_BASE_URL` env var (default `http://localhost:11434/v1`).
 
 ## Usage
 
 ```bash
-# Run with defaults (gpt-4o model, output in current directory)
+# Run with defaults (auto-detect provider; Claude/claude-opus-4-8 if available)
 python3 mac-ai-healthcheck.py
 
-# Specify a different model
-python3 mac-ai-healthcheck.py --model gpt-4o-mini
+# Force a specific provider
+python3 mac-ai-healthcheck.py --provider openai
+python3 mac-ai-healthcheck.py --provider gemini
+python3 mac-ai-healthcheck.py --provider ollama --model llama3.1
+
+# Pick a specific model (uses the matching provider's SDK)
+python3 mac-ai-healthcheck.py --model claude-sonnet-4-6
+python3 mac-ai-healthcheck.py --provider openai --model gpt-4o-mini
 
 # Save reports to a specific directory
 python3 mac-ai-healthcheck.py --out-dir ~/Desktop/reports
@@ -61,15 +102,20 @@ python3 mac-ai-healthcheck.py --out-dir ~/Desktop/reports
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--model` | OpenAI model to use | `gpt-4o` (or `OPENAI_MODEL` env var) |
+| `--provider` | AI provider: `anthropic`, `openai`, `gemini`, or `ollama` | auto-detect (Anthropic > OpenAI > Gemini > Ollama) |
+| `--model` | Model to use | provider default (`claude-opus-4-8` / `gpt-4o` / `gemini-2.5-pro` / `llama3.1`) |
 | `--out-dir` | Directory for output files | `.` (current directory) |
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | **(Required)** Your OpenAI API key |
-| `OPENAI_MODEL` | Override the default model without using `--model` |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (required for the Anthropic provider) |
+| `OPENAI_API_KEY` | Your OpenAI API key (required for the OpenAI provider) |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Your Google AI key (required for the Gemini provider) |
+| `PROVIDER` | Force a provider (`anthropic`, `openai`, `gemini`, `ollama`) without `--provider` |
+| `ANTHROPIC_MODEL` / `OPENAI_MODEL` / `GEMINI_MODEL` / `OLLAMA_MODEL` | Override the default model per provider |
+| `OLLAMA_BASE_URL` | Ollama server URL (default `http://localhost:11434/v1`) |
 
 ## Output Files
 
@@ -100,16 +146,17 @@ Each run produces three timestamped files:
 
 | Problem | Solution |
 |---------|----------|
-| `OPENAI_API_KEY not set` | Run `export OPENAI_API_KEY="sk-..."` |
-| `openai` module not found | Run `pip install -r requirements.txt` |
+| `..._API_KEY not set` | Set the key for your chosen provider, or pick another with `--provider` |
+| `anthropic` / `openai` / `google-genai` module not found | Run `pip install -r requirements.txt` |
+| Ollama: connection refused | Start the server with `ollama serve` and pull the model (`ollama pull <model>`) |
 | Script timeout | Some system commands may be slow; retry or check Activity Monitor |
 | Large capture output warning | Normal for busy systems; output is auto-truncated |
 
 ## Security & Privacy
 
 - All diagnostics run **locally** on your Mac.
-- Process names and system stats are sent to the OpenAI API for analysis.
-- No data is stored remotely beyond OpenAI's standard API data handling.
+- With a **cloud provider** (Anthropic, OpenAI, Gemini), process names and system stats are sent to that provider's API for analysis, subject to its standard data handling.
+- With **Ollama**, the model runs entirely on your machine — **no data leaves your Mac**.
 - Review the generated `.sh` script before running if you prefer manual control.
 
 ## License
