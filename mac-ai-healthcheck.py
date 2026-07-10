@@ -13,11 +13,14 @@ What this does:
 5. Launch: Automatically runs the macOS 'open' command to view the report in your browser.
 
 Setup:
-    pip install --upgrade openai
-    export OPENAI_API_KEY="your_api_key_here"
+    pip install --upgrade openai anthropic
+    # Pick a provider at runtime with --provider {openai,anthropic}.
+    # OpenAI:     export OPENAI_API_KEY="sk-..."
+    # Anthropic:  export ANTHROPIC_API_KEY="sk-ant-..."   (or use SSO: `ant auth login`)
 
 Run:
-    python3 mac_ai_diagnose_pipeline.py
+    python3 mac-ai-healthcheck.py --provider anthropic
+    # Your last-used provider is remembered, so later runs can omit --provider.
 """
 
 import argparse
@@ -45,6 +48,13 @@ try:
 except ImportError:
     OpenAI = None
 
+try:
+    import anthropic
+    from anthropic import Anthropic
+except ImportError:
+    anthropic = None
+    Anthropic = None
+
 # ANSI colors
 RESET   = "\033[0m"
 BOLD    = "\033[1m"
@@ -58,7 +68,13 @@ BLUE    = "\033[34m"
 WHITE   = "\033[37m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# PROVIDERS and DEFAULT_MODELS are derived from the provider registry defined below
+# (see @register_provider) — adding a provider is a single self-contained class.
+
+# Sticky "last used" provider/model memory (XDG config). Best-effort: never fails a run.
+CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "mac-ai-healthcheck"
+CONFIG_FILE = CONFIG_DIR / "config.json"
 
 
 def strip_ansi(text: str) -> str:
@@ -481,9 +497,232 @@ def make_json_safe_diag(diag):
 
 
 # ==============================================================================
+# LLM PROVIDERS
+# ==============================================================================
+# Each provider is a self-contained LLMProvider subclass registered with
+# @register_provider. To add one (e.g. a future `local` OpenAI-compatible backend
+# for Ollama / LM Studio / an MLX server), define a class with:
+#   - name          : the --provider value
+#   - default_model : used when no --model / <PROVIDER>_MODEL / sticky model is set
+#   - setup_help    : exact, copy-pasteable auth/config steps (shown in --help and
+#                     on any credential failure)
+#   - __init__      : verify the SDK imports + do any offline readiness check, then
+#                     construct the client
+#   - complete()    : map (prompt, temperature, max_tokens, stream, system) onto the
+#                     SDK and return raw text
+# ...then decorate it with @register_provider. Nothing else needs editing: PROVIDERS,
+# DEFAULT_MODELS, the --provider choices, and --help all derive from the registry.
+# `local` is intentionally NOT implemented yet — this is the seam it slots into.
+# ==============================================================================
+def fail(message: str):
+    print(f"{RED}Error: {message}{RESET}")
+    sys.exit(1)
+
+
+PROVIDER_CLASSES = {}  # name -> LLMProvider subclass (populated by @register_provider)
+
+
+def register_provider(cls):
+    PROVIDER_CLASSES[cls.name] = cls
+    return cls
+
+
+class LLMProvider:
+    """Provider-agnostic single-shot completion.
+
+    Both pipeline prompts are plain user prompts that must return raw text
+    (bounded Bash for the planner, a standalone HTML report for the analyst).
+    Each backend maps that contract onto its own SDK.
+    """
+    name = "base"
+    default_model = None
+    setup_help = ""
+
+    def __init__(self, model: str):
+        self.model = model
+
+    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None) -> str:
+        raise NotImplementedError
+
+
+@register_provider
+class OpenAIProvider(LLMProvider):
+    name = "openai"
+    default_model = "gpt-4o"
+    setup_help = textwrap.dedent("""\
+        OpenAI setup:
+          1. Get an API key:  https://platform.openai.com/api-keys
+          2. export OPENAI_API_KEY='sk-...'   (or put it in a .env file in this directory)
+          3. Optional: choose a model with --model or OPENAI_MODEL (default: gpt-4o)""")
+
+    def __init__(self, model):
+        super().__init__(model)
+        if OpenAI is None:
+            fail("OpenAI SDK not installed.  pip install --upgrade openai\n\n" + self.setup_help)
+        if not os.getenv("OPENAI_API_KEY"):
+            fail("OPENAI_API_KEY is not set.\n\n" + self.setup_help)
+        self.client = OpenAI()
+
+    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None):
+        # OpenAI request preserved exactly as the original tool sent it: model + messages
+        # + temperature, no max_tokens cap. (max_tokens/stream are Anthropic-only knobs and
+        # are intentionally ignored here so the OpenAI path is unchanged.)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        kwargs = {"model": self.model, "messages": messages}
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        resp = self.client.chat.completions.create(**kwargs)
+        return resp.choices[0].message.content or ""
+
+
+@register_provider
+class AnthropicProvider(LLMProvider):
+    name = "anthropic"
+    default_model = "claude-opus-4-8"
+    setup_help = textwrap.dedent("""\
+        Anthropic / Claude setup — choose ONE (the SDK checks them in this order):
+          - SSO sign-in (recommended; no API key to manage):
+              brew install anthropics/tap/ant     # one time
+              ant auth login                      # opens your browser / SSO
+          - API key:
+              export ANTHROPIC_API_KEY='sk-ant-...'   (or a .env file in this directory)
+          - Short-lived token from an existing `ant` session (e.g. CI):
+              set -a; eval "$(ant auth print-credentials --env)"; set +a
+          Optional: choose a model with --model or ANTHROPIC_MODEL (default: claude-opus-4-8)""")
+
+    def __init__(self, model):
+        super().__init__(model)
+        if Anthropic is None:
+            fail("Anthropic SDK not installed.  pip install --upgrade anthropic\n\n" + self.setup_help)
+        # Zero-arg client resolves credentials lazily and SSO-safely: ANTHROPIC_API_KEY,
+        # ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile. We deliberately pass no
+        # explicit key so an SSO profile is honored; auth is validated on the first request.
+        self.client = Anthropic()
+
+    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None):
+        # temperature is intentionally dropped — Claude Opus 4.7/4.8 reject sampling
+        # params (temperature/top_p/top_k) with a 400. Steer via the prompt instead.
+        kwargs = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        if system:
+            kwargs["system"] = system
+        try:
+            if stream:
+                # Large outputs (the HTML report) must stream to avoid SDK HTTP timeouts.
+                with self.client.messages.stream(**kwargs) as s:
+                    message = s.get_final_message()
+            else:
+                message = self.client.messages.create(**kwargs)
+        except anthropic.AuthenticationError as e:
+            # Server rejected the credentials we sent (bad/expired key, token, or profile).
+            # Credentials resolve lazily (API key OR ant auth login SSO profile), so this
+            # only surfaces here. Do NOT pre-check ANTHROPIC_API_KEY — that would wrongly
+            # reject SSO users whose key is unset but profile is valid.
+            fail(f"Anthropic authentication failed ({str(e)[:100]}).\n\n" + self.setup_help)
+        except TypeError as e:
+            # No credential source resolved at all (no API key, no auth token, no
+            # `ant auth login` profile). The SDK raises TypeError at request-build time.
+            if "authentication" in str(e).lower():
+                fail("No Anthropic credentials found — you are not signed in.\n\n" + self.setup_help)
+            raise
+        # Concatenate text blocks only; thinking blocks are skipped.
+        return "".join(
+            b.text for b in message.content if getattr(b, "type", None) == "text"
+        )
+
+
+# Derived from the registry — adding a provider above needs no edits here.
+PROVIDERS = tuple(PROVIDER_CLASSES)
+DEFAULT_MODELS = {name: cls.default_model for name, cls in PROVIDER_CLASSES.items()}
+
+
+def build_provider(provider_name: str, model: str) -> LLMProvider:
+    cls = PROVIDER_CLASSES.get(provider_name)
+    if cls is None:
+        fail(f"Unknown provider '{provider_name}'.  Choose from: {', '.join(PROVIDERS)}")
+    # __init__ verifies the SDK + credentials and prints setup_help on failure.
+    return cls(model)
+
+
+# ------------------------------------------------------------------------------
+# Provider selection + sticky "last used" memory
+# ------------------------------------------------------------------------------
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_config(cfg: dict):
+    # Best-effort: remembering the last provider must never break a run.
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def resolve_provider_and_model(args, cfg):
+    """Resolve (provider, model, source) with visible precedence.
+
+    provider:  --provider  >  HEALTHCHECK_PROVIDER  >  sticky  >  error
+    model:     --model      >  <PROVIDER>_MODEL       >  sticky  >  built-in default
+    """
+    if args.provider:
+        provider, source = args.provider, "--provider flag"
+    elif os.getenv("HEALTHCHECK_PROVIDER"):
+        provider, source = os.getenv("HEALTHCHECK_PROVIDER"), "HEALTHCHECK_PROVIDER env"
+    elif cfg.get("provider"):
+        provider, source = cfg["provider"], "remembered from last run (override with --provider)"
+    else:
+        fail(
+            "No provider selected.  Pass --provider {"
+            + ",".join(PROVIDERS)
+            + "} (remembered for next time), or set HEALTHCHECK_PROVIDER.\n"
+            "Run with --help to see per-provider setup instructions."
+        )
+
+    if provider not in PROVIDERS:
+        fail(f"Unknown provider '{provider}'.  Choose from: {', '.join(PROVIDERS)}")
+
+    if args.model:
+        model = args.model
+    elif os.getenv(f"{provider.upper()}_MODEL"):
+        model = os.getenv(f"{provider.upper()}_MODEL")
+    elif cfg.get("models", {}).get(provider):
+        model = cfg["models"][provider]
+    else:
+        model = DEFAULT_MODELS[provider]
+
+    return provider, model, source
+
+
+def remember_choice(cfg, provider, model):
+    cfg["provider"] = provider
+    cfg.setdefault("models", {})[provider] = model
+    save_config(cfg)
+
+
+def print_provider_banner(provider, model, source):
+    print(
+        f"{BOLD}{CYAN}Provider:{RESET} {provider}   {DIM}·{RESET}   "
+        f"{BOLD}{CYAN}model:{RESET} {model}   {DIM}·{RESET}   "
+        f"{DIM}source: {source}{RESET}"
+    )
+
+
+# ==============================================================================
 # AI RUN 1: THE PLANNER
 # ==============================================================================
-def plan_dynamic_capture(client, diag, local_report_plain, model):
+def plan_dynamic_capture(provider, diag):
     compact_json = json.dumps(make_json_safe_diag(diag), indent=2)
     prompt = textwrap.dedent(f"""
         You are Phase 1 of an automated macOS diagnostic pipeline.
@@ -521,13 +760,7 @@ def plan_dynamic_capture(client, diag, local_report_plain, model):
         ```
     """).strip()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-
-    content = response.choices[0].message.content
+    content = provider.complete(prompt, temperature=0.2, max_tokens=16000)
     match = re.search(r"```bash(.*?)```", content, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -537,7 +770,7 @@ def plan_dynamic_capture(client, diag, local_report_plain, model):
 # ==============================================================================
 # AI RUN 2: THE ANALYST (HTML GENERATOR)
 # ==============================================================================
-def analyze_deep_capture_html(client, capture_output, model):
+def analyze_deep_capture_html(provider, capture_output):
     prompt = textwrap.dedent(f"""
         You are Phase 2 of an automated macOS diagnostic pipeline.
         Below is the raw output from a targeted Bash diagnostic capture script executed on a Mac.
@@ -629,13 +862,7 @@ def analyze_deep_capture_html(client, capture_output, model):
         ```
     """).strip()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-
-    content = response.choices[0].message.content
+    content = provider.complete(prompt, temperature=0.3, max_tokens=64000, stream=True)
 
     if content.startswith("```html"):
         content = content.replace("```html", "", 1).rstrip("` \n")
@@ -651,10 +878,25 @@ def save_text(path: Path, text: str):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run Mac diagnostics with a 2-stage AI pipeline returning an HTML report."
+    setup_sections = "\n\n".join(
+        cls.setup_help for cls in PROVIDER_CLASSES.values() if cls.setup_help
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model to use. Default: {DEFAULT_MODEL}")
+    parser = argparse.ArgumentParser(
+        description="Run Mac diagnostics with a 2-stage AI pipeline returning an HTML report.",
+        epilog="provider setup\n" + ("-" * 40) + "\n" + setup_sections,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--provider", choices=PROVIDERS, default=None,
+        help="LLM provider. Falls back to HEALTHCHECK_PROVIDER, then your last-used "
+             "provider (remembered between runs).",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model for the chosen provider. Falls back to <PROVIDER>_MODEL, then the "
+             "last model used with that provider, then a built-in default "
+             f"({', '.join(f'{p}={m}' for p, m in DEFAULT_MODELS.items())}).",
+    )
     parser.add_argument("--out-dir", default=".", help="Directory where report files are saved.")
     return parser.parse_args()
 
@@ -664,13 +906,11 @@ def main():
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir).expanduser().resolve()
 
-    if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
-        print(f"{RED}Error: OpenAI SDK not installed or OPENAI_API_KEY not set.{RESET}")
-        print(f"  Install:  pip install --upgrade openai")
-        print(f"  Set key:  export OPENAI_API_KEY='sk-...'")
-        sys.exit(1)
-
-    client = OpenAI()
+    cfg = load_config()
+    provider_name, model, source = resolve_provider_and_model(args, cfg)
+    print_provider_banner(provider_name, model, source)
+    provider = build_provider(provider_name, model)
+    remember_choice(cfg, provider_name, model)
 
     # 1. INITIAL TRIAGE
     print(f"\n{BOLD}{CYAN}== Phase 1: Initial Triage =={RESET}")
@@ -680,7 +920,7 @@ def main():
 
     # 2. AI RUN 1 (Plan the Capture)
     print(f"{BOLD}{YELLOW}== Phase 2: AI Generating Targeted Capture Script =={RESET}")
-    bash_script_code = plan_dynamic_capture(client, diag, local_report_plain, args.model)
+    bash_script_code = plan_dynamic_capture(provider, diag)
 
     script_path = out_dir / f"dynamic_capture_{timestamp}.sh"
     save_text(script_path, bash_script_code)
@@ -716,7 +956,7 @@ def main():
     # 4. AI RUN 2 (Final HTML Analysis)
     print(f"\n{BOLD}{GREEN}== Phase 4: AI Deep Analysis (HTML Generation) =={RESET}")
     try:
-        final_html_analysis = analyze_deep_capture_html(client, capture_output, args.model)
+        final_html_analysis = analyze_deep_capture_html(provider, capture_output)
     except Exception as e:
         print(f"{RED}Analysis failed. Error: {e}{RESET}")
         sys.exit(1)

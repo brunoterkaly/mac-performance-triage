@@ -28,7 +28,9 @@ The generated HTML report includes:
 
 - **macOS** (uses macOS-specific system commands)
 - **Python 3.9+**
-- **OpenAI API key** (GPT-4o recommended)
+- **An LLM provider** — pick one at runtime with `--provider`:
+  - **OpenAI** (`gpt-4o` default) — needs `OPENAI_API_KEY`
+  - **Anthropic / Claude** (`claude-opus-4-8` default) — needs `ANTHROPIC_API_KEY`, or sign in with SSO via `ant auth login`
 
 ## Installation
 
@@ -40,36 +42,53 @@ cd mac-performance-triage
 # Install dependencies
 pip install -r requirements.txt
 
-# Set your OpenAI API key
-export OPENAI_API_KEY="your_api_key_here"
+# Configure whichever provider you'll use:
+#   OpenAI:
+export OPENAI_API_KEY="sk-..."
+#   Anthropic / Claude — either an API key:
+export ANTHROPIC_API_KEY="sk-ant-..."
+#   ...or SSO, with no key to manage:
+ant auth login
 ```
 
 ## Usage
 
 ```bash
-# Run with defaults (gpt-4o model, output in current directory)
+# Choose a provider (required the first time; remembered afterward)
+python3 mac-ai-healthcheck.py --provider anthropic
+python3 mac-ai-healthcheck.py --provider openai
+
+# Your last-used provider is remembered, so later runs can omit it
 python3 mac-ai-healthcheck.py
 
-# Specify a different model
-python3 mac-ai-healthcheck.py --model gpt-4o-mini
+# Pick a specific model for the chosen provider
+python3 mac-ai-healthcheck.py --provider anthropic --model claude-opus-4-8
+python3 mac-ai-healthcheck.py --provider openai --model gpt-4o-mini
 
 # Save reports to a specific directory
 python3 mac-ai-healthcheck.py --out-dir ~/Desktop/reports
 ```
 
+On startup the tool prints a banner showing the active provider, model, and where
+that choice came from (flag, env var, or remembered from your last run). Run
+`python3 mac-ai-healthcheck.py --help` for copy-pasteable setup steps for each provider.
+
 ### Command-Line Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--model` | OpenAI model to use | `gpt-4o` (or `OPENAI_MODEL` env var) |
+| `--provider` | LLM provider: `openai` or `anthropic` | Last-used (remembered); required on first run |
+| `--model` | Model for the chosen provider | `openai=gpt-4o`, `anthropic=claude-opus-4-8` (or `<PROVIDER>_MODEL` env / last-used) |
 | `--out-dir` | Directory for output files | `.` (current directory) |
 
 ### Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | **(Required)** Your OpenAI API key |
-| `OPENAI_MODEL` | Override the default model without using `--model` |
+| `HEALTHCHECK_PROVIDER` | Default provider (`openai`/`anthropic`) when `--provider` is omitted |
+| `OPENAI_API_KEY` | OpenAI API key (required for `--provider openai`) |
+| `ANTHROPIC_API_KEY` | Anthropic API key (for `--provider anthropic`; or use `ant auth login` SSO instead) |
+| `OPENAI_MODEL` / `ANTHROPIC_MODEL` | Override the model for that provider without `--model` |
 
 ## Output Files
 
@@ -100,16 +119,18 @@ Each run produces three timestamped files:
 
 | Problem | Solution |
 |---------|----------|
+| `No provider selected` | Pass `--provider openai` or `--provider anthropic` (remembered afterward) |
 | `OPENAI_API_KEY not set` | Run `export OPENAI_API_KEY="sk-..."` |
-| `openai` module not found | Run `pip install -r requirements.txt` |
+| `Anthropic authentication failed` | Run `ant auth login` (SSO), or `export ANTHROPIC_API_KEY="sk-ant-..."` |
+| `openai` / `anthropic` module not found | Run `pip install -r requirements.txt` |
 | Script timeout | Some system commands may be slow; retry or check Activity Monitor |
 | Large capture output warning | Normal for busy systems; output is auto-truncated |
 
 ## Security & Privacy
 
 - All diagnostics run **locally** on your Mac.
-- Process names and system stats are sent to the OpenAI API for analysis.
-- No data is stored remotely beyond OpenAI's standard API data handling.
+- Process names and system stats are sent to the **selected provider's** API (OpenAI or Anthropic) for analysis.
+- No data is stored remotely beyond that provider's standard API data handling.
 - Review the generated `.sh` script before running if you prefer manual control.
 
 ## License
