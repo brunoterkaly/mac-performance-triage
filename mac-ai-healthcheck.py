@@ -8,34 +8,32 @@ What this does:
 2. AI Pass 1 (Planner): Analyzes the triage and generates a custom Bash script
    targeting the specific processes acting up. It is strictly prompted to bound output.
 3. Execution: Runs the AI-generated targeted Bash script and enforces a character limit.
-4. AI Pass 2 (Analyst): Analyzes the deep capture output and generates a beautifully styled HTML report
-   with startup item audit, specific fix commands, and per-item impact estimates.
-5. Launch: Automatically runs the macOS 'open' command to view the report in your browser.
+4. AI Pass 2 (Analyst): Analyzes the deep capture output and generates a styled HTML
+   report with startup item audit, specific fix commands, and impact estimates.
+5. Launch: Opens the generated report in the default browser.
 
-<<<<<<< HEAD
-Setup (pick a provider — Anthropic is the default):
-    pip install -r requirements.txt
-    export ANTHROPIC_API_KEY="your_api_key_here"   # Claude (default)
-    export OPENAI_API_KEY="your_api_key_here"      # GPT
-    export GEMINI_API_KEY="your_api_key_here"      # Google Gemini
-    # or run fully local with Ollama (no key): ollama serve && ollama pull llama3.1
-
-Run:
-    python3 mac_ai_diagnose_pipeline.py
-    python3 mac_ai_diagnose_pipeline.py --provider openai
-    python3 mac_ai_diagnose_pipeline.py --provider gemini
-    python3 mac_ai_diagnose_pipeline.py --provider ollama --model llama3.1
-=======
 Setup:
-    pip install --upgrade openai anthropic
-    # Pick a provider at runtime with --provider {openai,anthropic}.
-    # OpenAI:     export OPENAI_API_KEY="sk-..."
-    # Anthropic:  export ANTHROPIC_API_KEY="sk-ant-..."   (or use SSO: `ant auth login`)
+    python3 -m pip install -r requirements.txt
+
+    # Anthropic: choose an API key, auth token, or SSO sign-in
+    export ANTHROPIC_API_KEY="sk-ant-..."
+    export ANTHROPIC_AUTH_TOKEN="..."
+    ant auth login
+
+    # Other cloud providers
+    export OPENAI_API_KEY="sk-..."
+    export GEMINI_API_KEY="..."
+
+    # Local Ollama
+    ollama serve
+    ollama pull llama3.1
 
 Run:
+    python3 mac-ai-healthcheck.py
     python3 mac-ai-healthcheck.py --provider anthropic
-    # Your last-used provider is remembered, so later runs can omit --provider.
->>>>>>> pr-2
+    python3 mac-ai-healthcheck.py --provider openai
+    python3 mac-ai-healthcheck.py --provider gemini
+    python3 mac-ai-healthcheck.py --provider ollama --model llama3.1
 """
 
 import argparse
@@ -54,13 +52,16 @@ from pathlib import Path
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
 
 try:
+    import anthropic
     from anthropic import Anthropic
 except ImportError:
+    anthropic = None
     Anthropic = None
 
 try:
@@ -69,216 +70,44 @@ except ImportError:
     OpenAI = None
 
 try:
-<<<<<<< HEAD
     from google import genai as google_genai
 except ImportError:
     google_genai = None
-=======
-    import anthropic
-    from anthropic import Anthropic
-except ImportError:
-    anthropic = None
-    Anthropic = None
->>>>>>> pr-2
 
 # ANSI colors
-RESET   = "\033[0m"
-BOLD    = "\033[1m"
-DIM     = "\033[2m"
-RED     = "\033[31m"
-YELLOW  = "\033[33m"
-GREEN   = "\033[32m"
-CYAN    = "\033[36m"
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
 MAGENTA = "\033[35m"
-BLUE    = "\033[34m"
-WHITE   = "\033[37m"
+BLUE = "\033[34m"
+WHITE = "\033[37m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
-<<<<<<< HEAD
-# Per-provider default models, overridable via env var or --model.
-DEFAULT_ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
-DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
-DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
-
-# Ollama serves an OpenAI-compatible API locally; default to the standard port.
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
-
-# The HTML report (Phase 2) can be long, so give the model generous headroom.
-# Anthropic requires an explicit max_tokens; values this large are streamed to
-# avoid SDK HTTP timeouts.
-PLANNER_MAX_TOKENS = 8000
-ANALYST_MAX_TOKENS = 32000
-=======
-# PROVIDERS and DEFAULT_MODELS are derived from the provider registry defined below
-# (see @register_provider) — adding a provider is a single self-contained class.
-
-# Sticky "last used" provider/model memory (XDG config). Best-effort: never fails a run.
-CONFIG_DIR = Path(os.getenv("XDG_CONFIG_HOME") or (Path.home() / ".config")) / "mac-ai-healthcheck"
+# Sticky last-used provider/model memory. Failure to read or write this file
+# never prevents the diagnostic from running.
+CONFIG_DIR = Path(
+    os.getenv("XDG_CONFIG_HOME") or (Path.home() / ".config")
+) / "mac-ai-healthcheck"
 CONFIG_FILE = CONFIG_DIR / "config.json"
->>>>>>> pr-2
+
+# Ollama exposes an OpenAI-compatible API on this URL by default.
+OLLAMA_BASE_URL = os.getenv(
+    "OLLAMA_BASE_URL",
+    "http://localhost:11434/v1",
+)
+
+# The planner produces a bounded Bash script. The analyst may produce a long HTML report.
+PLANNER_MAX_TOKENS = 16000
+ANALYST_MAX_TOKENS = 64000
 
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text or "")
-
-
-# ==============================================================================
-# AI PROVIDER ABSTRACTION
-# Supports Anthropic (Claude), OpenAI (GPT), Google (Gemini), and Ollama (local
-# models). The rest of the pipeline calls provider.complete(prompt, max_tokens)
-# and gets back plain text, so the two AI phases don't need to know which
-# backend is in use.
-# ==============================================================================
-class AnthropicProvider:
-    name = "anthropic"
-    default_model = DEFAULT_ANTHROPIC_MODEL
-
-    def __init__(self, model):
-        self.model = model
-        self.client = Anthropic()
-
-    def complete(self, prompt, max_tokens):
-        # Stream so large outputs (the HTML report) don't hit SDK HTTP timeouts.
-        # Adaptive thinking lets Claude decide how much to reason per request.
-        with self.client.messages.stream(
-            model=self.model,
-            max_tokens=max_tokens,
-            thinking={"type": "adaptive"},
-            messages=[{"role": "user", "content": prompt}],
-        ) as stream:
-            message = stream.get_final_message()
-        return next((b.text for b in message.content if b.type == "text"), "")
-
-
-class OpenAIProvider:
-    name = "openai"
-    default_model = DEFAULT_OPENAI_MODEL
-
-    def __init__(self, model):
-        self.model = model
-        self.client = OpenAI()
-
-    def complete(self, prompt, max_tokens):
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content or ""
-
-
-class GeminiProvider:
-    name = "gemini"
-    default_model = DEFAULT_GEMINI_MODEL
-
-    def __init__(self, model):
-        self.model = model
-        # Reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
-        self.client = google_genai.Client()
-
-    def complete(self, prompt, max_tokens):
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt,
-            config={"max_output_tokens": max_tokens},
-        )
-        return response.text or ""
-
-
-class OllamaProvider:
-    """Local models via Ollama's OpenAI-compatible API (no API key, no cloud).
-
-    Reuses the OpenAI SDK pointed at the local Ollama server, so it needs the
-    `openai` package installed and `ollama serve` running with the model pulled
-    (e.g. `ollama pull llama3.1`).
-    """
-    name = "ollama"
-    default_model = DEFAULT_OLLAMA_MODEL
-
-    def __init__(self, model):
-        self.model = model
-        # api_key is required by the SDK but ignored by Ollama; any value works.
-        self.client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
-
-    def complete(self, prompt, max_tokens):
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-        )
-        return response.choices[0].message.content or ""
-
-
-PROVIDER_CHOICES = ["anthropic", "openai", "gemini", "ollama"]
-
-
-def resolve_provider(requested_provider, model):
-    """Pick a provider, auto-detecting from available API keys when not forced.
-
-    Precedence when no provider is given via --provider / PROVIDER:
-      1. ANTHROPIC_API_KEY present       -> anthropic (the default cloud backend)
-      2. OPENAI_API_KEY present          -> openai
-      3. GEMINI_API_KEY/GOOGLE_API_KEY   -> gemini
-      4. otherwise                        -> ollama (fully local, no key needed)
-    The chosen model falls back to that provider's default when --model is unset.
-    """
-    has_anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY"))
-    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
-    has_gemini_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
-
-    choice = requested_provider or os.getenv("PROVIDER")
-    if not choice:
-        if has_anthropic_key:
-            choice = "anthropic"
-        elif has_openai_key:
-            choice = "openai"
-        elif has_gemini_key:
-            choice = "gemini"
-        else:
-            # No cloud key anywhere — fall back to a fully local Ollama model.
-            choice = "ollama"
-    choice = choice.lower()
-
-    if choice == "anthropic":
-        if Anthropic is None:
-            _fail("Anthropic SDK not installed.", install="pip install --upgrade anthropic")
-        if not has_anthropic_key:
-            _fail("ANTHROPIC_API_KEY not set.", key="export ANTHROPIC_API_KEY='sk-ant-...'")
-        return AnthropicProvider(model or DEFAULT_ANTHROPIC_MODEL)
-
-    if choice == "openai":
-        if OpenAI is None:
-            _fail("OpenAI SDK not installed.", install="pip install --upgrade openai")
-        if not has_openai_key:
-            _fail("OPENAI_API_KEY not set.", key="export OPENAI_API_KEY='sk-...'")
-        return OpenAIProvider(model or DEFAULT_OPENAI_MODEL)
-
-    if choice == "gemini":
-        if google_genai is None:
-            _fail("Google Gemini SDK not installed.", install="pip install --upgrade google-genai")
-        if not has_gemini_key:
-            _fail("GEMINI_API_KEY not set.", key="export GEMINI_API_KEY='...'")
-        return GeminiProvider(model or DEFAULT_GEMINI_MODEL)
-
-    if choice == "ollama":
-        # Local — needs the openai SDK and a running `ollama serve`. No key.
-        if OpenAI is None:
-            _fail("OpenAI SDK not installed (used as the Ollama client).",
-                  install="pip install --upgrade openai")
-        return OllamaProvider(model or DEFAULT_OLLAMA_MODEL)
-
-    _fail(f"Unknown provider '{choice}'. Choose one of: {', '.join(PROVIDER_CHOICES)}.")
-
-
-def _fail(message, install=None, key=None):
-    print(f"{RED}Error: {message}{RESET}")
-    if install:
-        print(f"  Install:  {install}")
-    if key:
-        print(f"  Set key:  {key}")
-    sys.exit(1)
 
 
 def run_cmd(cmd, timeout=10):
@@ -697,29 +526,15 @@ def make_json_safe_diag(diag):
 
 
 # ==============================================================================
-# LLM PROVIDERS
 # ==============================================================================
-# Each provider is a self-contained LLMProvider subclass registered with
-# @register_provider. To add one (e.g. a future `local` OpenAI-compatible backend
-# for Ollama / LM Studio / an MLX server), define a class with:
-#   - name          : the --provider value
-#   - default_model : used when no --model / <PROVIDER>_MODEL / sticky model is set
-#   - setup_help    : exact, copy-pasteable auth/config steps (shown in --help and
-#                     on any credential failure)
-#   - __init__      : verify the SDK imports + do any offline readiness check, then
-#                     construct the client
-#   - complete()    : map (prompt, temperature, max_tokens, stream, system) onto the
-#                     SDK and return raw text
-# ...then decorate it with @register_provider. Nothing else needs editing: PROVIDERS,
-# DEFAULT_MODELS, the --provider choices, and --help all derive from the registry.
-# `local` is intentionally NOT implemented yet — this is the seam it slots into.
+# LLM PROVIDERS
 # ==============================================================================
 def fail(message: str):
     print(f"{RED}Error: {message}{RESET}")
     sys.exit(1)
 
 
-PROVIDER_CLASSES = {}  # name -> LLMProvider subclass (populated by @register_provider)
+PROVIDER_CLASSES = {}
 
 
 def register_provider(cls):
@@ -728,12 +543,8 @@ def register_provider(cls):
 
 
 class LLMProvider:
-    """Provider-agnostic single-shot completion.
+    """Common completion interface used by both AI phases."""
 
-    Both pipeline prompts are plain user prompts that must return raw text
-    (bounded Bash for the planner, a standalone HTML report for the analyst).
-    Each backend maps that contract onto its own SDK.
-    """
     name = "base"
     default_model = None
     setup_help = ""
@@ -741,41 +552,16 @@ class LLMProvider:
     def __init__(self, model: str):
         self.model = model
 
-    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None) -> str:
+    def complete(
+        self,
+        prompt,
+        *,
+        temperature=None,
+        max_tokens=8192,
+        stream=False,
+        system=None,
+    ) -> str:
         raise NotImplementedError
-
-
-@register_provider
-class OpenAIProvider(LLMProvider):
-    name = "openai"
-    default_model = "gpt-4o"
-    setup_help = textwrap.dedent("""\
-        OpenAI setup:
-          1. Get an API key:  https://platform.openai.com/api-keys
-          2. export OPENAI_API_KEY='sk-...'   (or put it in a .env file in this directory)
-          3. Optional: choose a model with --model or OPENAI_MODEL (default: gpt-4o)""")
-
-    def __init__(self, model):
-        super().__init__(model)
-        if OpenAI is None:
-            fail("OpenAI SDK not installed.  pip install --upgrade openai\n\n" + self.setup_help)
-        if not os.getenv("OPENAI_API_KEY"):
-            fail("OPENAI_API_KEY is not set.\n\n" + self.setup_help)
-        self.client = OpenAI()
-
-    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None):
-        # OpenAI request preserved exactly as the original tool sent it: model + messages
-        # + temperature, no max_tokens cap. (max_tokens/stream are Anthropic-only knobs and
-        # are intentionally ignored here so the OpenAI path is unchanged.)
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        kwargs = {"model": self.model, "messages": messages}
-        if temperature is not None:
-            kwargs["temperature"] = temperature
-        resp = self.client.chat.completions.create(**kwargs)
-        return resp.choices[0].message.content or ""
 
 
 @register_provider
@@ -783,28 +569,41 @@ class AnthropicProvider(LLMProvider):
     name = "anthropic"
     default_model = "claude-opus-4-8"
     setup_help = textwrap.dedent("""\
-        Anthropic / Claude setup — choose ONE (the SDK checks them in this order):
-          - SSO sign-in (recommended; no API key to manage):
-              brew install anthropics/tap/ant     # one time
-              ant auth login                      # opens your browser / SSO
+        Anthropic / Claude setup — choose one:
+          - SSO sign-in:
+              brew install anthropics/tap/ant
+              ant auth login
           - API key:
-              export ANTHROPIC_API_KEY='sk-ant-...'   (or a .env file in this directory)
-          - Short-lived token from an existing `ant` session (e.g. CI):
-              set -a; eval "$(ant auth print-credentials --env)"; set +a
-          Optional: choose a model with --model or ANTHROPIC_MODEL (default: claude-opus-4-8)""")
+              export ANTHROPIC_API_KEY='sk-ant-...'
+          - Auth token:
+              export ANTHROPIC_AUTH_TOKEN='...'
+          Optional model override: --model or ANTHROPIC_MODEL
+          Default model: claude-opus-4-8""")
 
     def __init__(self, model):
         super().__init__(model)
         if Anthropic is None:
-            fail("Anthropic SDK not installed.  pip install --upgrade anthropic\n\n" + self.setup_help)
-        # Zero-arg client resolves credentials lazily and SSO-safely: ANTHROPIC_API_KEY,
-        # ANTHROPIC_AUTH_TOKEN, or an `ant auth login` profile. We deliberately pass no
-        # explicit key so an SSO profile is honored; auth is validated on the first request.
+            fail(
+                "Anthropic SDK not installed. "
+                "Run: python3 -m pip install --upgrade anthropic\n\n"
+                + self.setup_help
+            )
+
+        # The zero-argument client allows the SDK to resolve an API key,
+        # auth token, or supported CLI/SSO credentials.
         self.client = Anthropic()
 
-    def complete(self, prompt, *, temperature=None, max_tokens=8192, stream=False, system=None):
-        # temperature is intentionally dropped — Claude Opus 4.7/4.8 reject sampling
-        # params (temperature/top_p/top_k) with a 400. Steer via the prompt instead.
+    def complete(
+        self,
+        prompt,
+        *,
+        temperature=None,
+        max_tokens=8192,
+        stream=False,
+        system=None,
+    ):
+        # Adaptive thinking and temperature cannot be used together, so temperature
+        # is intentionally ignored for this provider.
         kwargs = {
             "model": self.model,
             "max_tokens": max_tokens,
@@ -813,46 +612,209 @@ class AnthropicProvider(LLMProvider):
         }
         if system:
             kwargs["system"] = system
+
         try:
             if stream:
-                # Large outputs (the HTML report) must stream to avoid SDK HTTP timeouts.
-                with self.client.messages.stream(**kwargs) as s:
-                    message = s.get_final_message()
+                with self.client.messages.stream(**kwargs) as response_stream:
+                    message = response_stream.get_final_message()
             else:
                 message = self.client.messages.create(**kwargs)
-        except anthropic.AuthenticationError as e:
-            # Server rejected the credentials we sent (bad/expired key, token, or profile).
-            # Credentials resolve lazily (API key OR ant auth login SSO profile), so this
-            # only surfaces here. Do NOT pre-check ANTHROPIC_API_KEY — that would wrongly
-            # reject SSO users whose key is unset but profile is valid.
-            fail(f"Anthropic authentication failed ({str(e)[:100]}).\n\n" + self.setup_help)
-        except TypeError as e:
-            # No credential source resolved at all (no API key, no auth token, no
-            # `ant auth login` profile). The SDK raises TypeError at request-build time.
-            if "authentication" in str(e).lower():
-                fail("No Anthropic credentials found — you are not signed in.\n\n" + self.setup_help)
+        except anthropic.AuthenticationError as exc:
+            fail(
+                f"Anthropic authentication failed ({str(exc)[:100]}).\n\n"
+                + self.setup_help
+            )
+        except TypeError as exc:
+            if "authentication" in str(exc).lower():
+                fail(
+                    "No Anthropic credentials were found.\n\n"
+                    + self.setup_help
+                )
             raise
-        # Concatenate text blocks only; thinking blocks are skipped.
+
         return "".join(
-            b.text for b in message.content if getattr(b, "type", None) == "text"
+            block.text
+            for block in message.content
+            if getattr(block, "type", None) == "text"
         )
 
 
-# Derived from the registry — adding a provider above needs no edits here.
+@register_provider
+class OpenAIProvider(LLMProvider):
+    name = "openai"
+    default_model = "gpt-4o"
+    setup_help = textwrap.dedent("""\
+        OpenAI setup:
+          1. Export an API key:
+               export OPENAI_API_KEY='sk-...'
+          2. Optional model override: --model or OPENAI_MODEL
+             Default model: gpt-4o""")
+
+    def __init__(self, model):
+        super().__init__(model)
+        if OpenAI is None:
+            fail(
+                "OpenAI SDK not installed. "
+                "Run: python3 -m pip install --upgrade openai\n\n"
+                + self.setup_help
+            )
+        if not os.getenv("OPENAI_API_KEY"):
+            fail("OPENAI_API_KEY is not set.\n\n" + self.setup_help)
+        self.client = OpenAI()
+
+    def complete(
+        self,
+        prompt,
+        *,
+        temperature=None,
+        max_tokens=8192,
+        stream=False,
+        system=None,
+    ):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        response = self.client.chat.completions.create(**kwargs)
+        return response.choices[0].message.content or ""
+
+
+@register_provider
+class GeminiProvider(LLMProvider):
+    name = "gemini"
+    default_model = "gemini-2.5-pro"
+    setup_help = textwrap.dedent("""\
+        Google Gemini setup:
+          1. Export an API key:
+               export GEMINI_API_KEY='...'
+             or:
+               export GOOGLE_API_KEY='...'
+          2. Optional model override: --model or GEMINI_MODEL
+             Default model: gemini-2.5-pro""")
+
+    def __init__(self, model):
+        super().__init__(model)
+        if google_genai is None:
+            fail(
+                "Google Gemini SDK not installed. "
+                "Run: python3 -m pip install --upgrade google-genai\n\n"
+                + self.setup_help
+            )
+        if not (
+            os.getenv("GEMINI_API_KEY")
+            or os.getenv("GOOGLE_API_KEY")
+        ):
+            fail("No Gemini API key was found.\n\n" + self.setup_help)
+        self.client = google_genai.Client()
+
+    def complete(
+        self,
+        prompt,
+        *,
+        temperature=None,
+        max_tokens=8192,
+        stream=False,
+        system=None,
+    ):
+        full_prompt = f"{system}\n\n{prompt}" if system else prompt
+        config = {"max_output_tokens": max_tokens}
+        if temperature is not None:
+            config["temperature"] = temperature
+
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=full_prompt,
+            config=config,
+        )
+        return response.text or ""
+
+
+@register_provider
+class OllamaProvider(LLMProvider):
+    name = "ollama"
+    default_model = "llama3.1"
+    setup_help = textwrap.dedent("""\
+        Ollama setup:
+          1. Start the server:
+               ollama serve
+          2. Download a model:
+               ollama pull llama3.1
+          3. Optional model override: --model or OLLAMA_MODEL
+             Default model: llama3.1""")
+
+    def __init__(self, model):
+        super().__init__(model)
+        if OpenAI is None:
+            fail(
+                "The OpenAI SDK is required for the Ollama client. "
+                "Run: python3 -m pip install --upgrade openai\n\n"
+                + self.setup_help
+            )
+        self.client = OpenAI(
+            base_url=OLLAMA_BASE_URL,
+            api_key="ollama",
+        )
+
+    def complete(
+        self,
+        prompt,
+        *,
+        temperature=None,
+        max_tokens=8192,
+        stream=False,
+        system=None,
+    ):
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            fail(
+                f"Could not connect to Ollama or run model '{self.model}': {exc}\n\n"
+                + self.setup_help
+            )
+        return response.choices[0].message.content or ""
+
+
 PROVIDERS = tuple(PROVIDER_CLASSES)
-DEFAULT_MODELS = {name: cls.default_model for name, cls in PROVIDER_CLASSES.items()}
+DEFAULT_MODELS = {
+    name: provider_class.default_model
+    for name, provider_class in PROVIDER_CLASSES.items()
+}
 
 
 def build_provider(provider_name: str, model: str) -> LLMProvider:
-    cls = PROVIDER_CLASSES.get(provider_name)
-    if cls is None:
-        fail(f"Unknown provider '{provider_name}'.  Choose from: {', '.join(PROVIDERS)}")
-    # __init__ verifies the SDK + credentials and prints setup_help on failure.
-    return cls(model)
+    provider_class = PROVIDER_CLASSES.get(provider_name)
+    if provider_class is None:
+        fail(
+            f"Unknown provider '{provider_name}'. "
+            f"Choose from: {', '.join(PROVIDERS)}"
+        )
+    return provider_class(model)
 
 
 # ------------------------------------------------------------------------------
-# Provider selection + sticky "last used" memory
+# Provider selection and remembered settings
 # ------------------------------------------------------------------------------
 def load_config() -> dict:
     try:
@@ -861,54 +823,67 @@ def load_config() -> dict:
         return {}
 
 
-def save_config(cfg: dict):
-    # Best-effort: remembering the last provider must never break a run.
+def save_config(config: dict):
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        CONFIG_FILE.write_text(
+            json.dumps(config, indent=2),
+            encoding="utf-8",
+        )
     except Exception:
         pass
 
 
-def resolve_provider_and_model(args, cfg):
-    """Resolve (provider, model, source) with visible precedence.
+def resolve_provider_and_model(args, config):
+    """Resolve the provider and model using flags, settings, credentials, and defaults."""
 
-    provider:  --provider  >  HEALTHCHECK_PROVIDER  >  sticky  >  error
-    model:     --model      >  <PROVIDER>_MODEL       >  sticky  >  built-in default
-    """
     if args.provider:
-        provider, source = args.provider, "--provider flag"
+        provider = args.provider
+        source = "--provider flag"
+    elif os.getenv("PROVIDER"):
+        provider = os.getenv("PROVIDER", "").lower()
+        source = "PROVIDER environment variable"
     elif os.getenv("HEALTHCHECK_PROVIDER"):
-        provider, source = os.getenv("HEALTHCHECK_PROVIDER"), "HEALTHCHECK_PROVIDER env"
-    elif cfg.get("provider"):
-        provider, source = cfg["provider"], "remembered from last run (override with --provider)"
+        provider = os.getenv("HEALTHCHECK_PROVIDER", "").lower()
+        source = "HEALTHCHECK_PROVIDER environment variable"
+    elif config.get("provider"):
+        provider = str(config["provider"]).lower()
+        source = "remembered from last run"
+    elif os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"):
+        provider = "anthropic"
+        source = "Anthropic credentials detected"
+    elif os.getenv("OPENAI_API_KEY"):
+        provider = "openai"
+        source = "OpenAI credentials detected"
+    elif os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        provider = "gemini"
+        source = "Gemini credentials detected"
     else:
-        fail(
-            "No provider selected.  Pass --provider {"
-            + ",".join(PROVIDERS)
-            + "} (remembered for next time), or set HEALTHCHECK_PROVIDER.\n"
-            "Run with --help to see per-provider setup instructions."
-        )
+        provider = "ollama"
+        source = "local fallback"
 
     if provider not in PROVIDERS:
-        fail(f"Unknown provider '{provider}'.  Choose from: {', '.join(PROVIDERS)}")
+        fail(
+            f"Unknown provider '{provider}'. "
+            f"Choose from: {', '.join(PROVIDERS)}"
+        )
 
     if args.model:
         model = args.model
     elif os.getenv(f"{provider.upper()}_MODEL"):
         model = os.getenv(f"{provider.upper()}_MODEL")
-    elif cfg.get("models", {}).get(provider):
-        model = cfg["models"][provider]
+    elif config.get("models", {}).get(provider):
+        model = config["models"][provider]
     else:
         model = DEFAULT_MODELS[provider]
 
     return provider, model, source
 
 
-def remember_choice(cfg, provider, model):
-    cfg["provider"] = provider
-    cfg.setdefault("models", {})[provider] = model
-    save_config(cfg)
+def remember_choice(config, provider, model):
+    config["provider"] = provider
+    config.setdefault("models", {})[provider] = model
+    save_config(config)
 
 
 def print_provider_banner(provider, model, source):
@@ -922,11 +897,7 @@ def print_provider_banner(provider, model, source):
 # ==============================================================================
 # AI RUN 1: THE PLANNER
 # ==============================================================================
-<<<<<<< HEAD
-def plan_dynamic_capture(provider, diag, local_report_plain):
-=======
 def plan_dynamic_capture(provider, diag):
->>>>>>> pr-2
     compact_json = json.dumps(make_json_safe_diag(diag), indent=2)
     prompt = textwrap.dedent(f"""
         You are Phase 1 of an automated macOS diagnostic pipeline.
@@ -964,11 +935,11 @@ def plan_dynamic_capture(provider, diag):
         ```
     """).strip()
 
-<<<<<<< HEAD
-    content = provider.complete(prompt, PLANNER_MAX_TOKENS)
-=======
-    content = provider.complete(prompt, temperature=0.2, max_tokens=16000)
->>>>>>> pr-2
+    content = provider.complete(
+        prompt,
+        temperature=0.2,
+        max_tokens=PLANNER_MAX_TOKENS,
+    )
     match = re.search(r"```bash(.*?)```", content, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -1070,11 +1041,12 @@ def analyze_deep_capture_html(provider, capture_output):
         ```
     """).strip()
 
-<<<<<<< HEAD
-    content = provider.complete(prompt, ANALYST_MAX_TOKENS)
-=======
-    content = provider.complete(prompt, temperature=0.3, max_tokens=64000, stream=True)
->>>>>>> pr-2
+    content = provider.complete(
+        prompt,
+        temperature=0.3,
+        max_tokens=ANALYST_MAX_TOKENS,
+        stream=True,
+    )
 
     if content.startswith("```html"):
         content = content.replace("```html", "", 1).rstrip("` \n")
@@ -1100,8 +1072,8 @@ def parse_args():
     )
     parser.add_argument(
         "--provider", choices=PROVIDERS, default=None,
-        help="LLM provider. Falls back to HEALTHCHECK_PROVIDER, then your last-used "
-             "provider (remembered between runs).",
+        help="LLM provider. Falls back to PROVIDER, HEALTHCHECK_PROVIDER, "
+             "your remembered choice, detected credentials, then Ollama.",
     )
     parser.add_argument(
         "--model", default=None,
@@ -1109,20 +1081,6 @@ def parse_args():
              "last model used with that provider, then a built-in default "
              f"({', '.join(f'{p}={m}' for p, m in DEFAULT_MODELS.items())}).",
     )
-<<<<<<< HEAD
-    parser.add_argument(
-        "--provider", choices=PROVIDER_CHOICES, default=None,
-        help="AI provider to use. Default: auto-detect from API keys "
-             "(Anthropic > OpenAI > Gemini > local Ollama), or set the PROVIDER env var.",
-    )
-    parser.add_argument(
-        "--model", default=None,
-        help="Model to use. Defaults to the chosen provider's default "
-             f"(anthropic: {DEFAULT_ANTHROPIC_MODEL}, openai: {DEFAULT_OPENAI_MODEL}, "
-             f"gemini: {DEFAULT_GEMINI_MODEL}, ollama: {DEFAULT_OLLAMA_MODEL}).",
-    )
-=======
->>>>>>> pr-2
     parser.add_argument("--out-dir", default=".", help="Directory where report files are saved.")
     return parser.parse_args()
 
@@ -1132,16 +1090,11 @@ def main():
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir).expanduser().resolve()
 
-<<<<<<< HEAD
-    provider = resolve_provider(args.provider, args.model)
-    print(f"{DIM}Using provider: {provider.name} (model: {provider.model}){RESET}")
-=======
     cfg = load_config()
     provider_name, model, source = resolve_provider_and_model(args, cfg)
     print_provider_banner(provider_name, model, source)
     provider = build_provider(provider_name, model)
     remember_choice(cfg, provider_name, model)
->>>>>>> pr-2
 
     # 1. INITIAL TRIAGE
     print(f"\n{BOLD}{CYAN}== Phase 1: Initial Triage =={RESET}")
@@ -1151,11 +1104,7 @@ def main():
 
     # 2. AI RUN 1 (Plan the Capture)
     print(f"{BOLD}{YELLOW}== Phase 2: AI Generating Targeted Capture Script =={RESET}")
-<<<<<<< HEAD
-    bash_script_code = plan_dynamic_capture(provider, diag, local_report_plain)
-=======
     bash_script_code = plan_dynamic_capture(provider, diag)
->>>>>>> pr-2
 
     script_path = out_dir / f"dynamic_capture_{timestamp}.sh"
     save_text(script_path, bash_script_code)
