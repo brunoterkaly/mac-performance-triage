@@ -526,7 +526,6 @@ def make_json_safe_diag(diag):
 
 
 # ==============================================================================
-# ==============================================================================
 # LLM PROVIDERS
 # ==============================================================================
 def fail(message: str):
@@ -602,14 +601,20 @@ class AnthropicProvider(LLMProvider):
         stream=False,
         system=None,
     ):
-        # Adaptive thinking and temperature cannot be used together, so temperature
-        # is intentionally ignored for this provider.
+        # Adaptive thinking and temperature cannot be used together, so
+        # temperature is intentionally ignored for Anthropic.
         kwargs = {
             "model": self.model,
             "max_tokens": max_tokens,
             "thinking": {"type": "adaptive"},
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
         }
+
         if system:
             kwargs["system"] = system
 
@@ -619,11 +624,13 @@ class AnthropicProvider(LLMProvider):
                     message = response_stream.get_final_message()
             else:
                 message = self.client.messages.create(**kwargs)
+
         except anthropic.AuthenticationError as exc:
             fail(
                 f"Anthropic authentication failed ({str(exc)[:100]}).\n\n"
                 + self.setup_help
             )
+
         except TypeError as exc:
             if "authentication" in str(exc).lower():
                 fail(
@@ -672,15 +679,28 @@ class OpenAIProvider(LLMProvider):
         system=None,
     ):
         messages = []
+
         if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+            messages.append({
+                "role": "system",
+                "content": system,
+            })
+
+        messages.append({
+            "role": "user",
+            "content": prompt,
+        })
+
+        # GPT-4o rejects completion limits above 16,384 tokens.
+        # Cap only the OpenAI request so providers with larger limits are unaffected.
+        safe_max_tokens = min(max_tokens, 16_384)
 
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": safe_max_tokens,
         }
+
         if temperature is not None:
             kwargs["temperature"] = temperature
 
