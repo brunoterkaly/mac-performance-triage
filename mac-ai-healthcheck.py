@@ -12,12 +12,18 @@ What this does:
    with startup item audit, specific fix commands, and per-item impact estimates.
 5. Launch: Automatically runs the macOS 'open' command to view the report in your browser.
 
-Setup:
-    pip install --upgrade openai
-    export OPENAI_API_KEY="your_api_key_here"
+Setup (pick a provider — Anthropic is the default):
+    pip install -r requirements.txt
+    export ANTHROPIC_API_KEY="your_api_key_here"   # Claude (default)
+    export OPENAI_API_KEY="your_api_key_here"      # GPT
+    export GEMINI_API_KEY="your_api_key_here"      # Google Gemini
+    # or run fully local with Ollama (no key): ollama serve && ollama pull llama3.1
 
 Run:
     python3 mac_ai_diagnose_pipeline.py
+    python3 mac_ai_diagnose_pipeline.py --provider openai
+    python3 mac_ai_diagnose_pipeline.py --provider gemini
+    python3 mac_ai_diagnose_pipeline.py --provider ollama --model llama3.1
 """
 
 import argparse
@@ -41,9 +47,19 @@ except ImportError:
     pass
 
 try:
+    from anthropic import Anthropic
+except ImportError:
+    Anthropic = None
+
+try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
+
+try:
+    from google import genai as google_genai
+except ImportError:
+    google_genai = None
 
 # ANSI colors
 RESET   = "\033[0m"
@@ -58,11 +74,182 @@ BLUE    = "\033[34m"
 WHITE   = "\033[37m"
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
+# Per-provider default models, overridable via env var or --model.
+DEFAULT_ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-8")
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+DEFAULT_GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1")
+
+# Ollama serves an OpenAI-compatible API locally; default to the standard port.
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+
+# The HTML report (Phase 2) can be long, so give the model generous headroom.
+# Anthropic requires an explicit max_tokens; values this large are streamed to
+# avoid SDK HTTP timeouts.
+PLANNER_MAX_TOKENS = 8000
+ANALYST_MAX_TOKENS = 32000
 
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text or "")
+
+
+# ==============================================================================
+# AI PROVIDER ABSTRACTION
+# Supports Anthropic (Claude), OpenAI (GPT), Google (Gemini), and Ollama (local
+# models). The rest of the pipeline calls provider.complete(prompt, max_tokens)
+# and gets back plain text, so the two AI phases don't need to know which
+# backend is in use.
+# ==============================================================================
+class AnthropicProvider:
+    name = "anthropic"
+    default_model = DEFAULT_ANTHROPIC_MODEL
+
+    def __init__(self, model):
+        self.model = model
+        self.client = Anthropic()
+
+    def complete(self, prompt, max_tokens):
+        # Stream so large outputs (the HTML report) don't hit SDK HTTP timeouts.
+        # Adaptive thinking lets Claude decide how much to reason per request.
+        with self.client.messages.stream(
+            model=self.model,
+            max_tokens=max_tokens,
+            thinking={"type": "adaptive"},
+            messages=[{"role": "user", "content": prompt}],
+        ) as stream:
+            message = stream.get_final_message()
+        return next((b.text for b in message.content if b.type == "text"), "")
+
+
+class OpenAIProvider:
+    name = "openai"
+    default_model = DEFAULT_OPENAI_MODEL
+
+    def __init__(self, model):
+        self.model = model
+        self.client = OpenAI()
+
+    def complete(self, prompt, max_tokens):
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content or ""
+
+
+class GeminiProvider:
+    name = "gemini"
+    default_model = DEFAULT_GEMINI_MODEL
+
+    def __init__(self, model):
+        self.model = model
+        # Reads GEMINI_API_KEY (or GOOGLE_API_KEY) from the environment.
+        self.client = google_genai.Client()
+
+    def complete(self, prompt, max_tokens):
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=prompt,
+            config={"max_output_tokens": max_tokens},
+        )
+        return response.text or ""
+
+
+class OllamaProvider:
+    """Local models via Ollama's OpenAI-compatible API (no API key, no cloud).
+
+    Reuses the OpenAI SDK pointed at the local Ollama server, so it needs the
+    `openai` package installed and `ollama serve` running with the model pulled
+    (e.g. `ollama pull llama3.1`).
+    """
+    name = "ollama"
+    default_model = DEFAULT_OLLAMA_MODEL
+
+    def __init__(self, model):
+        self.model = model
+        # api_key is required by the SDK but ignored by Ollama; any value works.
+        self.client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+
+    def complete(self, prompt, max_tokens):
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content or ""
+
+
+PROVIDER_CHOICES = ["anthropic", "openai", "gemini", "ollama"]
+
+
+def resolve_provider(requested_provider, model):
+    """Pick a provider, auto-detecting from available API keys when not forced.
+
+    Precedence when no provider is given via --provider / PROVIDER:
+      1. ANTHROPIC_API_KEY present       -> anthropic (the default cloud backend)
+      2. OPENAI_API_KEY present          -> openai
+      3. GEMINI_API_KEY/GOOGLE_API_KEY   -> gemini
+      4. otherwise                        -> ollama (fully local, no key needed)
+    The chosen model falls back to that provider's default when --model is unset.
+    """
+    has_anthropic_key = bool(os.getenv("ANTHROPIC_API_KEY"))
+    has_openai_key = bool(os.getenv("OPENAI_API_KEY"))
+    has_gemini_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"))
+
+    choice = requested_provider or os.getenv("PROVIDER")
+    if not choice:
+        if has_anthropic_key:
+            choice = "anthropic"
+        elif has_openai_key:
+            choice = "openai"
+        elif has_gemini_key:
+            choice = "gemini"
+        else:
+            # No cloud key anywhere — fall back to a fully local Ollama model.
+            choice = "ollama"
+    choice = choice.lower()
+
+    if choice == "anthropic":
+        if Anthropic is None:
+            _fail("Anthropic SDK not installed.", install="pip install --upgrade anthropic")
+        if not has_anthropic_key:
+            _fail("ANTHROPIC_API_KEY not set.", key="export ANTHROPIC_API_KEY='sk-ant-...'")
+        return AnthropicProvider(model or DEFAULT_ANTHROPIC_MODEL)
+
+    if choice == "openai":
+        if OpenAI is None:
+            _fail("OpenAI SDK not installed.", install="pip install --upgrade openai")
+        if not has_openai_key:
+            _fail("OPENAI_API_KEY not set.", key="export OPENAI_API_KEY='sk-...'")
+        return OpenAIProvider(model or DEFAULT_OPENAI_MODEL)
+
+    if choice == "gemini":
+        if google_genai is None:
+            _fail("Google Gemini SDK not installed.", install="pip install --upgrade google-genai")
+        if not has_gemini_key:
+            _fail("GEMINI_API_KEY not set.", key="export GEMINI_API_KEY='...'")
+        return GeminiProvider(model or DEFAULT_GEMINI_MODEL)
+
+    if choice == "ollama":
+        # Local — needs the openai SDK and a running `ollama serve`. No key.
+        if OpenAI is None:
+            _fail("OpenAI SDK not installed (used as the Ollama client).",
+                  install="pip install --upgrade openai")
+        return OllamaProvider(model or DEFAULT_OLLAMA_MODEL)
+
+    _fail(f"Unknown provider '{choice}'. Choose one of: {', '.join(PROVIDER_CHOICES)}.")
+
+
+def _fail(message, install=None, key=None):
+    print(f"{RED}Error: {message}{RESET}")
+    if install:
+        print(f"  Install:  {install}")
+    if key:
+        print(f"  Set key:  {key}")
+    sys.exit(1)
 
 
 def run_cmd(cmd, timeout=10):
@@ -483,7 +670,7 @@ def make_json_safe_diag(diag):
 # ==============================================================================
 # AI RUN 1: THE PLANNER
 # ==============================================================================
-def plan_dynamic_capture(client, diag, local_report_plain, model):
+def plan_dynamic_capture(provider, diag, local_report_plain):
     compact_json = json.dumps(make_json_safe_diag(diag), indent=2)
     prompt = textwrap.dedent(f"""
         You are Phase 1 of an automated macOS diagnostic pipeline.
@@ -521,13 +708,7 @@ def plan_dynamic_capture(client, diag, local_report_plain, model):
         ```
     """).strip()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2
-    )
-
-    content = response.choices[0].message.content
+    content = provider.complete(prompt, PLANNER_MAX_TOKENS)
     match = re.search(r"```bash(.*?)```", content, re.DOTALL)
     if match:
         return match.group(1).strip()
@@ -537,7 +718,7 @@ def plan_dynamic_capture(client, diag, local_report_plain, model):
 # ==============================================================================
 # AI RUN 2: THE ANALYST (HTML GENERATOR)
 # ==============================================================================
-def analyze_deep_capture_html(client, capture_output, model):
+def analyze_deep_capture_html(provider, capture_output):
     prompt = textwrap.dedent(f"""
         You are Phase 2 of an automated macOS diagnostic pipeline.
         Below is the raw output from a targeted Bash diagnostic capture script executed on a Mac.
@@ -629,13 +810,7 @@ def analyze_deep_capture_html(client, capture_output, model):
         ```
     """).strip()
 
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-    )
-
-    content = response.choices[0].message.content
+    content = provider.complete(prompt, ANALYST_MAX_TOKENS)
 
     if content.startswith("```html"):
         content = content.replace("```html", "", 1).rstrip("` \n")
@@ -654,7 +829,17 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Run Mac diagnostics with a 2-stage AI pipeline returning an HTML report."
     )
-    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"OpenAI model to use. Default: {DEFAULT_MODEL}")
+    parser.add_argument(
+        "--provider", choices=PROVIDER_CHOICES, default=None,
+        help="AI provider to use. Default: auto-detect from API keys "
+             "(Anthropic > OpenAI > Gemini > local Ollama), or set the PROVIDER env var.",
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Model to use. Defaults to the chosen provider's default "
+             f"(anthropic: {DEFAULT_ANTHROPIC_MODEL}, openai: {DEFAULT_OPENAI_MODEL}, "
+             f"gemini: {DEFAULT_GEMINI_MODEL}, ollama: {DEFAULT_OLLAMA_MODEL}).",
+    )
     parser.add_argument("--out-dir", default=".", help="Directory where report files are saved.")
     return parser.parse_args()
 
@@ -664,13 +849,8 @@ def main():
     timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir).expanduser().resolve()
 
-    if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
-        print(f"{RED}Error: OpenAI SDK not installed or OPENAI_API_KEY not set.{RESET}")
-        print(f"  Install:  pip install --upgrade openai")
-        print(f"  Set key:  export OPENAI_API_KEY='sk-...'")
-        sys.exit(1)
-
-    client = OpenAI()
+    provider = resolve_provider(args.provider, args.model)
+    print(f"{DIM}Using provider: {provider.name} (model: {provider.model}){RESET}")
 
     # 1. INITIAL TRIAGE
     print(f"\n{BOLD}{CYAN}== Phase 1: Initial Triage =={RESET}")
@@ -680,7 +860,7 @@ def main():
 
     # 2. AI RUN 1 (Plan the Capture)
     print(f"{BOLD}{YELLOW}== Phase 2: AI Generating Targeted Capture Script =={RESET}")
-    bash_script_code = plan_dynamic_capture(client, diag, local_report_plain, args.model)
+    bash_script_code = plan_dynamic_capture(provider, diag, local_report_plain)
 
     script_path = out_dir / f"dynamic_capture_{timestamp}.sh"
     save_text(script_path, bash_script_code)
@@ -716,7 +896,7 @@ def main():
     # 4. AI RUN 2 (Final HTML Analysis)
     print(f"\n{BOLD}{GREEN}== Phase 4: AI Deep Analysis (HTML Generation) =={RESET}")
     try:
-        final_html_analysis = analyze_deep_capture_html(client, capture_output, args.model)
+        final_html_analysis = analyze_deep_capture_html(provider, capture_output)
     except Exception as e:
         print(f"{RED}Analysis failed. Error: {e}{RESET}")
         sys.exit(1)
